@@ -13,8 +13,10 @@ import logging
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from einops import rearrange
 
 logger = logging.getLogger(__name__)
+from vector_quantize_pytorch import VectorQuantize
 
 class GPTConfig:
     """ base GPT config, params common to all GPT versions """
@@ -78,6 +80,20 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_drop(self.proj(y))
         return y
 
+h_vq_heads = 4
+
+def quantize(x, vq, partial=None):
+    x = rearrange(x, 'b t (h n) -> b t h n', h=h_vq_heads) #, n=x.size(-1)//h_vq_heads
+    if partial is None:
+        quantized, _, commit_loss = vq(x) 
+    else:
+        b = x[...,:partial,:]
+        c = x[...,partial:,:]
+        b, _, commit_loss = vq(b) 
+        quantized = torch.concat((b,c), -2)
+        
+    return rearrange(quantized, 'b t h n -> b t (h n)'), commit_loss
+    
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
@@ -92,8 +108,31 @@ class Block(nn.Module):
             nn.Linear(4 * config.n_embd, config.n_embd),
             nn.Dropout(config.resid_pdrop),
         )
-
+        self.commit_loss = 0
+        self.vq = VectorQuantize(
+                dim = config.n_embd //h_vq_heads,
+                codebook_size = 256,     # codebook size
+                decay = .9,             # the exponential moving average decay, lower means the dictionary will change faster
+                commitment = 1.,        # the weight on the commitment loss
+            #    codebook_dim = 16,
+                use_cosine_sim = True,
+             #   threshold_ema_dead_code = 1. 
+            )
+        
     def forward(self, x):
+        #x = x + self.attn(self.ln1(x))
+        #x, self.commit_loss = quantize(x, self.vq) 
+        #x = x + self.mlp(self.ln2(x))
+        
+        #x = x + self.attn(self.ln1(x))
+        #quantized, self.commit_loss = quantize(x, self.vq) 
+        #x = x + self.mlp(self.ln2(quantized))
+
+        #quantized, self.commit_loss = quantize(self.attn(self.ln1(x)), self.vq) 
+        #x = x + self.mlp(self.ln2(quantized))
+        
+        # good with math
+        x, self.commit_loss = quantize(x, self.vq, 1) 
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
@@ -192,6 +231,7 @@ class GPT(nn.Module):
         # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
+            aux_loss = sum([b.commit_loss for b in self.blocks.children()])
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) + aux_loss
+            #print(aux_loss)
         return logits, loss
