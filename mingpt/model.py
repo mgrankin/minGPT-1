@@ -80,7 +80,7 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_drop(self.proj(y))
         return y
 
-h_vq_heads = 4
+h_vq_heads = 16
 
 def quantize(x, vq, partial=None):
     x = rearrange(x, 'b t (h n) -> b t h n', h=h_vq_heads) #, n=x.size(-1)//h_vq_heads
@@ -97,7 +97,7 @@ def quantize(x, vq, partial=None):
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
-    def __init__(self, config):
+    def __init__(self, config, vq):
         super().__init__()
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.ln2 = nn.LayerNorm(config.n_embd)
@@ -109,15 +109,7 @@ class Block(nn.Module):
             nn.Dropout(config.resid_pdrop),
         )
         self.commit_loss = 0
-        self.vq = VectorQuantize(
-                dim = config.n_embd //h_vq_heads,
-                codebook_size = 256,     # codebook size
-                decay = .9,             # the exponential moving average decay, lower means the dictionary will change faster
-                commitment = 1.,        # the weight on the commitment loss
-            #    codebook_dim = 16,
-                use_cosine_sim = True,
-             #   threshold_ema_dead_code = 1. 
-            )
+        self.vq = vq
         
     def forward(self, x):
         #x = x + self.attn(self.ln1(x))
@@ -132,7 +124,7 @@ class Block(nn.Module):
         #x = x + self.mlp(self.ln2(quantized))
         
         # good with math
-        x, self.commit_loss = quantize(x, self.vq, 1) 
+        x, self.commit_loss = quantize(x, self.vq) 
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
@@ -148,7 +140,16 @@ class GPT(nn.Module):
         self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
         self.drop = nn.Dropout(config.embd_pdrop)
         # transformer
-        self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
+        self.vq = VectorQuantize(
+                dim = config.n_embd //h_vq_heads,
+                codebook_size = 256,     # codebook size
+                decay = .99,             # the exponential moving average decay, lower means the dictionary will change faster
+                commitment = 1.,        # the weight on the commitment loss
+            #    codebook_dim = 16,
+                use_cosine_sim = True,
+             #   threshold_ema_dead_code = 1. 
+            )
+        self.blocks = nn.Sequential(*[Block(config, self.vq) for _ in range(config.n_layer)])
         # decoder head
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
