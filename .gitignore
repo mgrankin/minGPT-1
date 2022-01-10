@@ -1,2 +1,5 @@
-.ipynb_checkpoints/
-__pycache__/
+.ipynb_checkpoints
+__pycache__
+cifar-10-python.tar.gz
+cifar10_model.pt
+cifar-10-batches-py
