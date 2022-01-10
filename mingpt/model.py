@@ -13,10 +13,8 @@ import logging
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from einops import rearrange
 
 logger = logging.getLogger(__name__)
-from vector_quantize_pytorch import VectorQuantize
 
 class GPTConfig:
     """ base GPT config, params common to all GPT versions """
@@ -80,24 +78,10 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_drop(self.proj(y))
         return y
 
-h_vq_heads = 16
-
-def quantize(x, vq, partial=None):
-    x = rearrange(x, 'b t (h n) -> b t h n', h=h_vq_heads) #, n=x.size(-1)//h_vq_heads
-    if partial is None:
-        quantized, _, commit_loss = vq(x) 
-    else:
-        b = x[...,:partial,:]
-        c = x[...,partial:,:]
-        b, _, commit_loss = vq(b) 
-        quantized = torch.concat((b,c), -2)
-        
-    return rearrange(quantized, 'b t h n -> b t (h n)'), commit_loss
-    
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
-    def __init__(self, config, vq):
+    def __init__(self, config):
         super().__init__()
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.ln2 = nn.LayerNorm(config.n_embd)
@@ -108,23 +92,8 @@ class Block(nn.Module):
             nn.Linear(4 * config.n_embd, config.n_embd),
             nn.Dropout(config.resid_pdrop),
         )
-        self.commit_loss = 0
-        self.vq = vq
-        
-    def forward(self, x):
-        #x = x + self.attn(self.ln1(x))
-        #x, self.commit_loss = quantize(x, self.vq) 
-        #x = x + self.mlp(self.ln2(x))
-        
-        #x = x + self.attn(self.ln1(x))
-        #quantized, self.commit_loss = quantize(x, self.vq) 
-        #x = x + self.mlp(self.ln2(quantized))
 
-        #quantized, self.commit_loss = quantize(self.attn(self.ln1(x)), self.vq) 
-        #x = x + self.mlp(self.ln2(quantized))
-        
-        # good with math
-        x, self.commit_loss = quantize(x, self.vq) 
+    def forward(self, x):
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
@@ -140,16 +109,7 @@ class GPT(nn.Module):
         self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
         self.drop = nn.Dropout(config.embd_pdrop)
         # transformer
-        self.vq = VectorQuantize(
-                dim = config.n_embd //h_vq_heads,
-                codebook_size = 256,     # codebook size
-                decay = .99,             # the exponential moving average decay, lower means the dictionary will change faster
-                commitment = 1.,        # the weight on the commitment loss
-            #    codebook_dim = 16,
-                use_cosine_sim = True,
-             #   threshold_ema_dead_code = 1. 
-            )
-        self.blocks = nn.Sequential(*[Block(config, self.vq) for _ in range(config.n_layer)])
+        self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
         # decoder head
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -232,7 +192,6 @@ class GPT(nn.Module):
         # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
-            aux_loss = sum([b.commit_loss for b in self.blocks.children()])
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) + aux_loss
-            #print(aux_loss)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
         return logits, loss
