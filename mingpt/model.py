@@ -98,6 +98,53 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln2(x))
         return x
 
+class WideNetBlock(nn.Module):
+    """ an unassuming Transformer block """
+
+    def __init__(self, attn, moe_mlp, config):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(config.n_embd)
+        self.ln2 = nn.LayerNorm(config.n_embd)
+        #self.attn = attn
+        self.attn = CausalSelfAttention(config)
+        self.moe_mlp = moe_mlp
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        out, aux_loss = self.moe_mlp(self.ln2(x))
+        x = x + out
+        return x, aux_loss
+
+from mixture_of_experts import MoE
+
+class WideNetBlocks(nn.Module):
+    """ an unassuming Transformer block """
+
+    def __init__(self, config):
+        super().__init__()
+        self.attn = CausalSelfAttention(config)
+        self.moe_mlp = MoE(
+            dim = config.n_embd,
+            num_experts = config.n_layer,      
+            hidden_dim = 4 * config.n_embd,      
+            activation = nn.GELU,    
+            second_policy_train = "all", 
+            second_policy_eval = "all",  
+            second_threshold_train = 0.2,
+            second_threshold_eval = 0.2,
+            capacity_factor_train = 1.25,   
+            capacity_factor_eval = 2.,     
+            loss_coef = 1e-2               
+        )
+        self.blocks = nn.ModuleList([WideNetBlock(self.attn, self.moe_mlp, config) for _ in range(config.n_layer)])
+
+    def forward(self, x):
+        aux_loss = 0
+        for block in self.blocks:
+            x, block_aux_loss = block(x)
+            aux_loss = aux_loss + block_aux_loss
+        return x, aux_loss
+
 class GPT(nn.Module):
     """  the full GPT language model, with a context size of block_size """
 
@@ -109,7 +156,7 @@ class GPT(nn.Module):
         self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
         self.drop = nn.Dropout(config.embd_pdrop)
         # transformer
-        self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
+        self.blocks = WideNetBlocks(config)
         # decoder head
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -123,6 +170,7 @@ class GPT(nn.Module):
         return self.block_size
 
     def _init_weights(self, module):
+        cal_std = math.sqrt(2/(512*4*5))
         if isinstance(module, (nn.Linear, nn.Embedding)):
             module.weight.data.normal_(mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
@@ -130,6 +178,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
+        #else: print(module.__class__)
 
     def configure_optimizers(self, train_config):
         """
@@ -144,22 +193,14 @@ class GPT(nn.Module):
         no_decay = set()
         whitelist_weight_modules = (torch.nn.Linear, )
         blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
-        for mn, m in self.named_modules():
-            for pn, p in m.named_parameters():
-                fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
-
-                if pn.endswith('bias'):
-                    # all biases will not be decayed
-                    no_decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
-                    # weights of whitelist modules will be weight decayed
-                    decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
-                    # weights of blacklist modules will NOT be weight decayed
-                    no_decay.add(fpn)
-
-        # special case the position embedding parameter in the root GPT module as not decayed
-        no_decay.add('pos_emb')
+        #print([pn for pn,p in self.named_parameters()])
+        for pn, p in self.named_parameters():
+            if pn.endswith('bias') or '.ln' in pn or '_emb' in pn:
+                # all biases will not be decayed
+                no_decay.add(pn)
+            else:
+#                no_decay.add(pn)
+                decay.add(pn)
 
         # validate that we considered every parameter
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -185,7 +226,7 @@ class GPT(nn.Module):
         token_embeddings = self.tok_emb(idx) # each index maps to a (learnable) vector
         position_embeddings = self.pos_emb[:, :t, :] # each position maps to a (learnable) vector
         x = self.drop(token_embeddings + position_embeddings)
-        x = self.blocks(x)
+        x, aux_loss = self.blocks(x)
         x = self.ln_f(x)
         logits = self.head(x)
 
@@ -193,5 +234,4 @@ class GPT(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
-        return logits, loss
+        return logits, loss + aux_loss, aux_loss
